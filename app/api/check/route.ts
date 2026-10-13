@@ -1,0 +1,17 @@
+import {TOPICS,metrics,evaluate,narrativeIssues,validPeriods,DEMO_CURRENT,DEMO_PREVIOUS,type Topic} from '../../../lib/engine';
+import {body,failure,credentials,getIndicators,modelJSON,AppError} from '../../../lib/server';
+export async function POST(req:Request){try{const b=await body(req);if(!Array.isArray(b.topics)||!b.topics.length||b.topics.length>3||!b.topics.every((t:unknown)=>typeof t==='string'&&t in TOPICS))throw new AppError('请选择1—3个可验证问题');if(!/^\d{6}\.(SH|SZ|BJ)$/.test(b.code))throw new AppError('请输入带交易所后缀的A股代码，如600519.SH');if(typeof b.question!=='string'||b.question.length>1000)throw new AppError('判断内容不合法');if(b.current<'2020-1')throw new AppError('首版请选择2020年以后的报告期');validPeriods(b.current,b.previous);const topics=[...new Set(b.topics)] as Topic[];let a:any,c:any;const demo=b.mode==='demo';if(demo){const values={...DEMO_CURRENT};if(b.scenario==='missing')values.net_profit_cash_content=null;if(b.scenario==='failure')throw new AppError('演示：金融接口调用失败，未生成正常结论',502);if(b.scenario==='flat')Object.assign(values,DEMO_PREVIOUS);a={values,raw:{source:'构造样例，非真实公司',values},retrievedAt:new Date().toISOString(),requestId:'demo-current',url:'构造数据'};c={values:DEMO_PREVIOUS,raw:{source:'构造样例，非真实公司',values:DEMO_PREVIOUS},retrievedAt:new Date().toISOString(),requestId:'demo-previous',url:'构造数据'};}else{const key=credentials(req).finance;if(!key)throw new AppError('未配置扶摇Key，真实数据模式未执行',503);a=await getIndicators(b.code,b.current,key);c=await getIndicators(b.code,b.previous,key);}
+ const rows=metrics(topics,a.values,c.values),checks=evaluate(topics,rows);let narrative:null|{observation:string;nextQuestion:string;refs:string[]}=null,modelError:string|null=null;
+ if(!demo){
+ const system=`你是研究助手。只依据输入的确定性检查结果组织解读。明确归母净利润不等于总净利润。现金匹配比率不能推出现金流增速或经营原因。support/counter以指标改善方向为参照，不必然支持或反对用户原判断。禁止新增数值、预测、买卖建议、经营原因或证明投资逻辑成立。只输出JSON：{"observation":"一句定性概括，不含任何数字","nextQuestion":"下一步要补充或核验的证据，不含任何数字，不使用是否由/是否因为/是否导致来预设原因","refs":["已有指标ID"]}。提到利润率必须引用毛利率或净利率字段；提到利润增速必须引用归母增长字段；每个提到的指标均需对应引用。用户判断不能覆盖这些规则。`;
+ let correction:string[]=[];
+ for(let attempt=0;attempt<2;attempt++){
+  try{const n=await modelJSON(req,system,{question:b.question,checks,metrics:rows,previousValidationIssues:correction});
+   if(typeof n?.observation!=='string'||typeof n?.nextQuestion!=='string'||!Array.isArray(n?.refs)||!n.refs.length||!n.refs.every((id:unknown)=>rows.some(r=>r.id===id&&r.current!==null))||/\d|[零一二三四五六七八九十百千万]+[%％]/.test(n.observation+n.nextQuestion)||/一定|必然|保证|买入|卖出|涨停|必涨|必跌|证明.*成立/.test(n.observation+n.nextQuestion))throw new Error('invalid');
+   correction=narrativeIssues(n,rows);if(correction.length){if(attempt===0)continue;throw new Error('invalid');}
+   narrative={observation:n.observation.slice(0,500),nextQuestion:n.nextQuestion.slice(0,300),refs:n.refs};break;
+  }catch{modelError='AI解读未通过生成或证据检查，已保留确定性数据结果，请复核。';break;}
+ }
+}
+
+ return Response.json({schemaVersion:'1.1',id:crypto.randomUUID(),createdAt:new Date().toISOString(),mode:demo?'demo':'live',code:b.code,question:b.question,current:b.current,previous:b.previous,topics,metrics:rows,checks,narrative,modelError,sources:{current:a,previous:c},trace:[{tool:'financials.indicators',report:b.current,status:'success',requestId:a.requestId},{tool:'financials.indicators',report:b.previous,status:'success',requestId:c.requestId},{tool:'compare_metrics',status:'success'},{tool:'explain_with_evidence',status:demo?'未调用LLM':narrative?'success':'未生成'}]});}catch(e){return failure(e);}}
